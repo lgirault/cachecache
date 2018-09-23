@@ -34,10 +34,12 @@ object Cache {
 
   }
 
-  private case class CacheItem[A](
+  private sealed abstract class CacheContent[F[_], A]
+  private case class Fetching[F[_], A](fetchedItem : F[A]) extends CacheContent[F, A]
+  private case class CacheItem[F[_], A](
                                    item: A,
                                    itemExpiration: Option[TimeSpec]
-                                 )
+                                 ) extends CacheContent[F, A]
 
   /**
     * Create a new cache with a default expiration value for newly added cache items.
@@ -49,7 +51,7 @@ object Cache {
   def createCache[F[_] : Concurrent : Timer, K, V](defaultExpiration: Option[TimeSpec],
                                                    defaultReloadTime: Option[TimeSpec])
                                                   (fetch: K => F[V]): F[Cache[F, K, V]] =
-    Ref.of[F, Map[K, CacheItem[V]]](Map.empty[K, CacheItem[V]])
+    Ref.of[F, Map[K, CacheContent[F, V]]](Map.empty[K, CacheContent[F, V]])
       .map(new Cache[F, K, V](_, defaultExpiration, defaultReloadTime, fetch))
 
 
@@ -78,6 +80,8 @@ object Cache {
   def insert[F[_] : Sync : Timer, K, V](cache: Cache[F, K, V])(k: K, v: V): F[Unit] =
     insertWithTimeout(cache)(cache.defaultExpiration)(k, v)
 
+
+
   /**
     * Insert an item in the cache, with an explicit expiration value.
     *
@@ -92,18 +96,23 @@ object Cache {
     for {
       now <- T.clock.monotonic(NANOSECONDS)
       timeout = optionTimeout.map(ts => TimeSpec.unsafeFromNanos(now + ts.nanos))
-      _ <- cache.ref.update(m => m + (k -> CacheItem[V](v, timeout)))
+      _ <- cache.ref.update(_ + (k -> CacheItem[F, V](v, timeout)))
     } yield ()
 
+  private def insertFetch[F[_], K, V](cache: Cache[F, K, V])
+                                     (k: K, v: F[V]) : F[Unit] =
+    cache.ref.update(_ + (k -> Fetching[F, V](v)) )
 
-  private def isExpired[A](checkAgainst: TimeSpec, cacheItem: CacheItem[A]): Boolean = {
+
+
+  private def isExpired[F[_], A](checkAgainst: TimeSpec, cacheItem: CacheItem[F, A]): Boolean = {
     cacheItem.itemExpiration.fold(false) {
       case e if e.nanos < checkAgainst.nanos => true
       case _ => false
     }
   }
 
-  private def lookupItemSimple[F[_] : Sync, K, V](k: K, c: Cache[F, K, V]): F[Option[CacheItem[V]]] =
+  private def lookupItemSimple[F[_] : Sync, K, V](k: K, c: Cache[F, K, V]): F[Option[CacheContent[F, V]]] =
     c.ref.get.map(_.get(k))
 
   private def fetchInsert[F[_] : Sync : Timer, K, V](k: K, c: Cache[F, K, V]): F[V] =
@@ -115,15 +124,17 @@ object Cache {
 
   private def autoReload[F[_], K, V](k: K, c: Cache[F, K, V])
                                     (implicit C: Concurrent[F],
-                                     T: Timer[F]): F[Unit] =
+                                     T: Timer[F]): Option[F[V]] =
     c.defaultReloadTime.map {
       reloadTime =>
-        for {
+        val res = for {
           f <- C.start[V](T.sleep(Duration.fromNanos(reloadTime.nanos)) >> c.fetch(k))
           v <- f.join
-          _ <- insert(c)(k, v)
-        } yield ()
-    }.getOrElse(C.unit)
+        } yield v
+
+        insertFetch(c)(k, res) >> res
+
+    }
 
   /**
     * Internal Function Used for Lookup and management of values.
@@ -136,9 +147,9 @@ object Cache {
       i <- lookupItemSimple(k, c)
       v <- i match {
         case None => //first lookup, launch autoreload if needed
-          autoReload(k, c) >> fetchInsert(k, c)
-
-        case Some(v0) =>
+          autoReload(k, c) getOrElse fetchInsert(k, c)
+        case Some(v0: Fetching[F, V]) => v0.fetchedItem
+        case Some(v0 : CacheItem[F, V]) =>
           if (isExpired(t, v0)) fetchInsert(k, c)
           else C.pure(v0.item)
       }
@@ -154,7 +165,7 @@ object Cache {
 
 }
 
-class Cache[F[_] : Concurrent : Timer, K, V](private val ref: Ref[F, Map[K, Cache.CacheItem[V]]],
+class Cache[F[_] : Concurrent : Timer, K, V](private val ref: Ref[F, Map[K, Cache.CacheContent[F, V]]],
                                              val defaultExpiration: Option[TimeSpec],
                                              val defaultReloadTime: Option[TimeSpec],
                                              val fetch: K => F[V]) {
