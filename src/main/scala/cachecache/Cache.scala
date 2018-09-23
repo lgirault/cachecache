@@ -9,7 +9,7 @@ import cats.syntax.flatMap._
 import cats.syntax.functor._
 
 import scala.collection.immutable.Map
-import scala.concurrent.duration.{FiniteDuration, _}
+import scala.concurrent.duration._
 
 object Cache {
 
@@ -35,11 +35,21 @@ object Cache {
   }
 
   private sealed abstract class CacheContent[F[_], A]
-  private case class Fetching[F[_], A](fetchedItem : F[A]) extends CacheContent[F, A]
+
+  private case class Fetching[F[_], A](current: Fiber[F, A],
+                                       autoReload: Fiber[F, Unit]) extends CacheContent[F, A] {
+
+    def cancel(implicit M: Monad[F]): F[Unit] =
+      current.cancel >> autoReload.cancel
+
+  }
+
+
   private case class CacheItem[F[_], A](
-                                   item: A,
-                                   itemExpiration: Option[TimeSpec]
-                                 ) extends CacheContent[F, A]
+                                         item: A,
+                                         itemExpiration: Option[TimeSpec],
+                                         autoReload : Option[Fetching[F, A]]
+                                       ) extends CacheContent[F, A]
 
   /**
     * Create a new cache with a default expiration value for newly added cache items.
@@ -81,7 +91,6 @@ object Cache {
     insertWithTimeout(cache)(cache.defaultExpiration)(k, v)
 
 
-
   /**
     * Insert an item in the cache, with an explicit expiration value.
     *
@@ -89,19 +98,44 @@ object Cache {
     *
     * The expiration value is relative to the current clockMonotonic time, i.e. it will be automatically added to the result of clockMonotonic for the supplied unit.
     **/
+
   def insertWithTimeout[F[_] : Sync, K, V](cache: Cache[F, K, V])
                                           (optionTimeout: Option[TimeSpec])
                                           (k: K, v: V)
-                                          (implicit T: Timer[F]): F[Unit] =
+                                          (implicit T: Timer[F]): F[Unit] = {
+
+    def updateMap(timeout: Option[TimeSpec])
+                 (m: Map[K, CacheContent[F, V]]) : Map[K, CacheContent[F, V]] =
+      m.get(k) match {
+        case None => m + (k -> CacheItem[F, V](v, timeout, None))
+        case Some(content : Fetching[F, V]) => m + (k -> CacheItem[F, V](v, timeout, Some(content)))
+        case Some(content : CacheItem[F, V]) => m + (k -> CacheItem[F, V](v, timeout, content.autoReload))
+      }
+
     for {
       now <- T.clock.monotonic(NANOSECONDS)
       timeout = optionTimeout.map(ts => TimeSpec.unsafeFromNanos(now + ts.nanos))
-      _ <- cache.ref.update(_ + (k -> CacheItem[F, V](v, timeout)))
+      _ <- cache.ref.update(updateMap(timeout))
     } yield ()
+  }
 
-  private def insertFetch[F[_], K, V](cache: Cache[F, K, V])
-                                     (k: K, v: F[V]) : F[Unit] =
-    cache.ref.update(_ + (k -> Fetching[F, V](v)) )
+
+  private def insertFetch[F[_], K, V](k: K, cache: Cache[F, K, V])
+                                     (current: Fiber[F, V], f: Fiber[F, Unit])
+                                     (implicit S: Sync[F]): F[Unit] = {
+
+    val newBinding = (k ->  Fetching[F, V](current, f))
+
+    def updateMap(m: Map[K, CacheContent[F, V]]) : (Map[K, CacheContent[F, V]], F[Unit]) = {
+      (m + newBinding, m.get(k) match {
+        case None =>   S.unit
+        case Some(content : Fetching[F, V]) => content.cancel
+        case Some(content : CacheItem[F, V]) => content.autoReload.map(_.cancel) getOrElse S.unit
+      }
+
+    }
+    cache.ref.modify(updateMap).flatten
+  }
 
 
 
@@ -122,36 +156,47 @@ object Cache {
     } yield v
 
 
-  private def autoReload[F[_], K, V](k: K, c: Cache[F, K, V])
+  private def autoReload[F[_], K, V](k: K, c: Cache[F, K, V], t: TimeSpec)
                                     (implicit C: Concurrent[F],
-                                     T: Timer[F]): Option[F[V]] =
+                                     T: Timer[F]): F[Unit] =
     c.defaultReloadTime.map {
       reloadTime =>
-        val res = for {
-          f <- C.start[V](T.sleep(Duration.fromNanos(reloadTime.nanos)) >> c.fetch(k))
-          v <- f.join
-        } yield v
 
-        insertFetch(c)(k, res) >> res
+        def loop(): F[Unit] = //XXX is it stack safe ??
+          C.start[V](T.sleep(Duration.fromNanos(reloadTime.nanos)) >> c.fetch(k))
+            .flatMap { fiber: Fiber[F, V] =>
 
-    }
+              C.start[Unit](fiber.join.flatMap(insert(c)(k, _)) >> loop() )
+                  .flatMap(insertFetch(k, c)(fiber, _))
+            }
+
+        loop()
+
+    } getOrElse C.unit
 
   /**
     * Internal Function Used for Lookup and management of values.
     * If isExpired and The boolean for delete is present then we delete,
     * otherwise return the value.
     **/
+
+  private def extractContentT[F[_] : Timer, K, V](k: K, c: Cache[F, K, V], t: TimeSpec)
+                                                 (content: CacheContent[F, V])
+                                                 (implicit S: Sync[F]): F[V] = content match {
+    case v0: Fetching[F, V] => v0.current.join
+    case v0: CacheItem[F, V] =>
+      if (isExpired(t, v0)) fetchInsert(k, c)
+      else S.pure(v0.item)
+  }
+
   private def lookupItemT[F[_] : Timer, K, V](k: K, c: Cache[F, K, V], t: TimeSpec)
                                              (implicit C: Concurrent[F]): F[V] = {
     for {
       i <- lookupItemSimple(k, c)
       v <- i match {
         case None => //first lookup, launch autoreload if needed
-          autoReload(k, c) getOrElse fetchInsert(k, c)
-        case Some(v0: Fetching[F, V]) => v0.fetchedItem
-        case Some(v0 : CacheItem[F, V]) =>
-          if (isExpired(t, v0)) fetchInsert(k, c)
-          else C.pure(v0.item)
+          autoReload(k, c, t) >> fetchInsert(k, c)
+        case Some(content) => extractContentT(k, c, t)(content)
       }
     } yield v
   }
