@@ -143,7 +143,6 @@ object Cache {
     } yield v
 
 
-  /// XXX get and set is not atomic
   private def autoReload[F[_], K, V](k: K, c: Cache[F, K, V], t: TimeSpec)
                                     (implicit C: Concurrent[F],
                                      T: Timer[F]): F[Unit] =
@@ -159,7 +158,9 @@ object Cache {
 
         val go: F[Unit] = reloads.get.map(_.contains(k)) >>= { alreadySetup =>
             if (alreadySetup) C.unit
-            else C.start(loop()).map(f => reloads.update(_ + (k -> f)))
+            else C.start(loop()) // just in case a loop has already started we check the previous value
+              .map(f => reloads.modify(m => (m + (k -> f), m.get(k)))).flatten
+              .flatMap(fOpt => fOpt.map(_.cancel).getOrElse(C.unit))
           }
 
         go
