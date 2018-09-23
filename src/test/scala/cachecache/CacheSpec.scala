@@ -2,13 +2,10 @@ package cachecache
 
 import org.specs2.mutable.Specification
 
-import scala.concurrent.duration._
-import cats.effect._
 import cats.syntax.functor._
 import scala.concurrent.ExecutionContext
 import cats.effect.IO
 import cats.effect.concurrent.Ref
-//import cats.effect.implicits._
 
 import scala.concurrent.duration._
 
@@ -63,7 +60,9 @@ class CacheSpec extends Specification {
         cValue <- count.get
 
       } yield (cValue, value)
-      setup.unsafeRunSync must_=== (4, 1)
+
+      val (cValue, value) = setup.unsafeRunSync
+      (value must_=== 1).and(cValue >= 4)
     }
 
   }
